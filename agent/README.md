@@ -47,7 +47,7 @@ Real environment variables take precedence over the file.
 | `AGENT_HOST` / `AGENT_PORT` | no | HTTP API bind address. Defaults to `127.0.0.1` / `8000`; use `0.0.0.0` to expose it on the network |
 | `AGENT_API_KEY` | no | If set, HTTP clients must send `Authorization: Bearer <key>` |
 | `AGENT_CORS_ORIGINS` | no | Browser origins allowed to call the API, i.e. where `ui/` is served. Defaults to `http://localhost:8080,http://127.0.0.1:8080` |
-| `AGENT_SESSIONS_DB` | no | SQLite file for conversation history. Defaults to `agent/sessions.db` |
+| `AGENT_SESSIONS_DB` | no | SQLite file for conversation history. Defaults to `agent/sessions.db`. Its folder must be writable. If it isn't, as in many containers, the agent logs a warning and falls back to the system temp folder, where history is lost on restart. In deployments, point it at a writable, persistent volume, e.g. `/data/sessions.db` |
 | `AGENT_LOG_LEVEL` | no | `INFO` (default) logs every request; `DEBUG` also logs tool arguments |
 | `AGENT_LOG_MESSAGES` | no | `true` (default) includes the first 200 characters of each user message in logs; `false` logs only its length |
 

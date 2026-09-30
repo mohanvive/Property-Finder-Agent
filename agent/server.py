@@ -29,7 +29,9 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -84,6 +86,48 @@ def setup_logging(level: str) -> None:
         app_log.propagate = False
 
 
+def _db_writable(path: Path) -> str | None:
+    """Return None if SQLite can create/write ``path`` (and its journal), else the error."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")  # takes a write lock: creates the file, needs a writable dir
+            conn.rollback()
+        finally:
+            conn.close()
+        return None
+    except (OSError, sqlite3.Error) as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def resolve_sessions_db(configured: str) -> str:
+    """Use the configured session DB if writable; otherwise fall back to the temp directory.
+
+    Containers often run with a read-only app directory, where the default agent/sessions.db
+    cannot be created. Failing over here keeps chat working instead of every request erroring.
+    """
+    path = Path(configured).expanduser()
+    error = _db_writable(path)
+    if error is None:
+        log.info("Conversation history database: %s", path)
+        return str(path)
+
+    fallback = Path(tempfile.gettempdir()) / "property-finder-sessions.db"
+    fallback_error = _db_writable(fallback)
+    if fallback_error is None:
+        log.warning(
+            "Cannot write conversation history database %s (%s). Using %s instead; history there is "
+            "lost on restart and not shared between replicas. Set AGENT_SESSIONS_DB to a writable, "
+            "persistent path (e.g. a mounted volume) to fix this.", path, error, fallback,
+        )
+        return str(fallback)
+    raise RuntimeError(
+        f"No writable location for the conversation history database: {path} ({error}); "
+        f"{fallback} ({fallback_error}). Set AGENT_SESSIONS_DB to a writable path."
+    )
+
+
 def preview(text: str, enabled: bool) -> str:
     if not enabled:
         return f"<{len(text)} chars>"
@@ -130,6 +174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sys.exit(f"Configuration error: {exc}")
     cfg = settings
     setup_logging(cfg.server.log_level)
+    sessions_db = resolve_sessions_db(cfg.server.sessions_db)
     agent: Agent | None = None
     servers: list[MCPServer] = []
 
@@ -187,7 +232,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     def open_session(session_id: str) -> SQLiteSession:
-        return SQLiteSession(session_id, db_path=cfg.server.sessions_db)
+        return SQLiteSession(session_id, db_path=sessions_db)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

@@ -1,5 +1,12 @@
 openai-agents>=0.22
+# mcp 2.x recovers when the Choreo MCP servers drop a session (HTTP 404); 1.x fails with
+# "Session terminated". Note: traceloop's MCP instrumentor (opentelemetry-instrumentation-mcp
+# <= 0.62.x) doesn't support 2.x yet and logs a harmless "Error initializing MCP instrumentor".
+mcp>=2,<3
 httpx>=0.27
 python-dotenv>=1.0
 fastapi>=0.115
 uvicorn[standard]>=0.30
+# Trace export to WSO2 Agent Management Platform. Must live in this same environment
+# as the agent: run with `.venv/bin/amp-instrument .venv/bin/python server.py`.
+amp-instrumentation>=0.3.0

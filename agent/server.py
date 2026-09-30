@@ -28,7 +28,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import sqlite3
 import sys
 import tempfile
@@ -40,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from openai.types.responses import ResponseTextDeltaEvent
@@ -195,7 +194,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         CORSMiddleware,
         allow_origins=cfg.server.cors_origins,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        # x-api-key is sent by the web UI for the gateway in front of the agent; the agent ignores it.
+        allow_headers=["Content-Type", "X-Request-ID", "x-api-key"],
+        expose_headers=["X-Request-ID"],
     )
 
     @app.middleware("http")
@@ -221,16 +222,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Request-ID"] = request_id
         return response
 
-    def require_api_key(request: Request) -> None:
-        expected = cfg.server.api_key
-        if not expected:
-            return
-        header = request.headers.get("Authorization", "")
-        token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
-        if not secrets.compare_digest(token, expected):
-            log.warning("Rejected request: invalid or missing API key")
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
     def open_session(session_id: str) -> SQLiteSession:
         return SQLiteSession(session_id, db_path=sessions_db)
 
@@ -245,10 +236,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "model": cfg.openai.model,
             "llm_endpoint": cfg.openai.base_url or "https://api.openai.com/v1",
             "mcp_servers": mcp,
-            "auth_required": bool(cfg.server.api_key),
         }
 
-    @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
+    @app.post("/chat", response_model=ChatResponse)
     async def chat(body: ChatRequest) -> ChatResponse:
         session_id = resolve_session_id(body.session_id)
         log.info("Chat request: session=%s%s message=%s", session_id,
@@ -267,7 +257,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                  tool_calls_in(result) or "none", len(reply), time.perf_counter() - started)
         return ChatResponse(reply=reply, session_id=session_id)
 
-    @app.post("/chat/stream", dependencies=[Depends(require_api_key)])
+    @app.post("/chat/stream")
     async def chat_stream(body: ChatRequest) -> StreamingResponse:
         session_id = resolve_session_id(body.session_id)
         request_id = request_id_var.get()
@@ -321,7 +311,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    @app.get("/sessions/{session_id}/messages", dependencies=[Depends(require_api_key)])
+    @app.get("/sessions/{session_id}/messages")
     async def get_messages(session_id: str) -> dict[str, Any]:
         log.info("History request: session=%s", session_id)
         session = open_session(resolve_session_id(session_id))
@@ -341,7 +331,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 messages.append({"role": role, "content": content})
         return {"session_id": session_id, "messages": messages}
 
-    @app.delete("/sessions/{session_id}", status_code=204, dependencies=[Depends(require_api_key)])
+    @app.delete("/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: str) -> None:
         log.info("Delete session request: session=%s", session_id)
         session = open_session(resolve_session_id(session_id))

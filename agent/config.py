@@ -43,7 +43,6 @@ class ServerConfig:
 
     host: str
     port: int
-    api_key: str | None  # when set, clients must send "Authorization: Bearer <key>"
     cors_origins: list[str]
     sessions_db: str  # SQLite file holding per-session conversation history
     log_level: str  # DEBUG, INFO, WARNING, ...
@@ -122,7 +121,6 @@ def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
         server=ServerConfig(
             host=os.getenv("AGENT_HOST", "").strip() or "127.0.0.1",
             port=port,
-            api_key=_optional("AGENT_API_KEY"),
             cors_origins=[o.strip() for o in cors.split(",") if o.strip()],
             sessions_db=os.getenv("AGENT_SESSIONS_DB", "").strip() or str(AGENT_DIR / "sessions.db"),
             log_level=log_level,

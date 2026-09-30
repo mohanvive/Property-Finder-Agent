@@ -46,6 +46,8 @@ class ServerConfig:
     api_key: str | None  # when set, clients must send "Authorization: Bearer <key>"
     cors_origins: list[str]
     sessions_db: str  # SQLite file holding per-session conversation history
+    log_level: str  # DEBUG, INFO, WARNING, ...
+    log_messages: bool  # include (truncated) user messages in request logs
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,9 @@ def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
     except ValueError as exc:
         raise ConfigError("AGENT_PORT must be an integer.") from exc
     cors = os.getenv("AGENT_CORS_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080")
+    log_level = (os.getenv("AGENT_LOG_LEVEL", "").strip() or "INFO").upper()
+    if log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise ConfigError("AGENT_LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL.")
 
     return Settings(
         openai=OpenAIConfig(
@@ -120,5 +125,7 @@ def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
             api_key=_optional("AGENT_API_KEY"),
             cors_origins=[o.strip() for o in cors.split(",") if o.strip()],
             sessions_db=os.getenv("AGENT_SESSIONS_DB", "").strip() or str(AGENT_DIR / "sessions.db"),
+            log_level=log_level,
+            log_messages=os.getenv("AGENT_LOG_MESSAGES", "true").strip().lower() in ("1", "true", "yes"),
         ),
     )

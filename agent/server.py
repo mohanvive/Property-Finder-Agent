@@ -23,14 +23,16 @@ Run:  python server.py [--config agent/.env] [--host H] [--port P]
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import logging
 import os
 import re
 import secrets
 import sys
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -38,11 +40,12 @@ from typing import Any
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from openai.types.responses import ResponseTextDeltaEvent
 from pydantic import BaseModel, Field
 
-from agents import Agent, Runner, SQLiteSession
+from agents import Agent, Runner, RunResult, SQLiteSession
+from agents.items import ToolCallItem
 from agents.mcp import MCPServer
 from config import AGENT_DIR, DEFAULT_CONFIG_FILE, ConfigError, Settings, load_settings
 from property_agent import build_agent, configure_openai, connect_servers, describe_error
@@ -51,6 +54,49 @@ log = logging.getLogger("property-finder.server")
 
 MAX_TURNS = 15
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MESSAGE_PREVIEW_CHARS = 200
+
+# Request ID of the request being handled, attached to every log line it produces.
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+def setup_logging(level: str) -> None:
+    """Send property-finder logs to stderr with timestamps and request IDs.
+
+    Uses its own handler (not the root logger) so it works under uvicorn, `uvicorn --factory`,
+    and tracing wrappers such as amp-instrument that may reconfigure root logging.
+    """
+    app_log = logging.getLogger("property-finder")
+    app_log.setLevel(level)
+    if not app_log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-5s [%(request_id)s] %(name)s: %(message)s")
+        )
+        handler.addFilter(RequestIdFilter())
+        app_log.addHandler(handler)
+        app_log.propagate = False
+
+
+def preview(text: str, enabled: bool) -> str:
+    if not enabled:
+        return f"<{len(text)} chars>"
+    flat = " ".join(text.split())
+    return json.dumps(flat if len(flat) <= MESSAGE_PREVIEW_CHARS else flat[:MESSAGE_PREVIEW_CHARS] + "…")
+
+
+def tool_calls_in(result: RunResult) -> list[str]:
+    return [
+        getattr(item.raw_item, "name", None) or "tool"
+        for item in result.new_items
+        if isinstance(item, ToolCallItem)
+    ]
 
 
 class ChatRequest(BaseModel):
@@ -83,6 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ConfigError as exc:
             sys.exit(f"Configuration error: {exc}")
     cfg = settings
+    setup_logging(cfg.server.log_level)
     agent: Agent | None = None
     servers: list[MCPServer] = []
 
@@ -106,6 +153,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["Authorization", "Content-Type"],
     )
 
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        """Log every HTTP request with a request ID (echoed back in the X-Request-ID header)."""
+        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+        token = request_id_var.set(request_id)
+        client = request.client.host if request.client else "-"
+        started = time.perf_counter()
+        log.info("Request received: %s %s from %s", request.method, request.url.path, client)
+        try:
+            response = await call_next(request)
+            # For event streams this marks the stream opening; the chat handler logs its completion.
+            streaming = response.headers.get("content-type", "").startswith("text/event-stream")
+            log.info("%s: %s %s -> %d in %.0f ms", "Stream opened" if streaming else "Response sent",
+                     request.method, request.url.path, response.status_code,
+                     (time.perf_counter() - started) * 1000)
+        except Exception:
+            log.exception("Request failed: %s %s", request.method, request.url.path)
+            raise
+        finally:
+            request_id_var.reset(token)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
     def require_api_key(request: Request) -> None:
         expected = cfg.server.api_key
         if not expected:
@@ -113,6 +183,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         header = request.headers.get("Authorization", "")
         token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
         if not secrets.compare_digest(token, expected):
+            log.warning("Rejected request: invalid or missing API key")
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     def open_session(session_id: str) -> SQLiteSession:
@@ -135,24 +206,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
     async def chat(body: ChatRequest) -> ChatResponse:
         session_id = resolve_session_id(body.session_id)
+        log.info("Chat request: session=%s%s message=%s", session_id,
+                 "" if body.session_id else " (new)", preview(body.message, cfg.server.log_messages))
+        started = time.perf_counter()
         session = open_session(session_id)
         try:
             result = await Runner.run(agent, body.message, session=session, max_turns=MAX_TURNS)
         except Exception as exc:  # noqa: BLE001 - surface agent failures as HTTP errors
-            log.exception("Agent run failed")
+            log.exception("Chat failed: session=%s after %.1f s", session_id, time.perf_counter() - started)
             raise HTTPException(status_code=502, detail=describe_error(exc)) from exc
         finally:
             session.close()
-        return ChatResponse(reply=str(result.final_output), session_id=session_id)
+        reply = str(result.final_output)
+        log.info("Chat completed: session=%s tools=%s reply=%d chars in %.1f s", session_id,
+                 tool_calls_in(result) or "none", len(reply), time.perf_counter() - started)
+        return ChatResponse(reply=reply, session_id=session_id)
 
     @app.post("/chat/stream", dependencies=[Depends(require_api_key)])
     async def chat_stream(body: ChatRequest) -> StreamingResponse:
         session_id = resolve_session_id(body.session_id)
+        request_id = request_id_var.get()
+        log.info("Chat stream request: session=%s%s message=%s", session_id,
+                 "" if body.session_id else " (new)", preview(body.message, cfg.server.log_messages))
 
         async def events() -> AsyncIterator[str]:
+            # The body streams after the middleware returns, so restore the request ID here.
+            request_id_var.set(request_id)
+            started = time.perf_counter()
             yield sse({"type": "session", "session_id": session_id})
             session = open_session(session_id)
             tool_names: dict[str, str] = {}
+            completed = False
             try:
                 result = Runner.run_streamed(agent, body.message, session=session, max_turns=MAX_TURNS)
                 async for event in result.stream_events():
@@ -164,15 +248,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             name = getattr(raw, "name", None) or "tool"
                             if call_id := getattr(raw, "call_id", None):
                                 tool_names[call_id] = name
+                            log.info("Tool call: session=%s tool=%s", session_id, name)
+                            log.debug("Tool arguments: %s", getattr(raw, "arguments", ""))
                             yield sse({"type": "tool_call", "name": name, "arguments": getattr(raw, "arguments", "")})
                         elif event.name == "tool_output":
                             call_id = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
                             yield sse({"type": "tool_done", "name": tool_names.get(call_id, "tool")})
-                yield sse({"type": "done", "reply": str(result.final_output)})
+                reply = str(result.final_output)
+                completed = True
+                log.info("Chat stream completed: session=%s tools=%s reply=%d chars in %.1f s", session_id,
+                         list(tool_names.values()) or "none", len(reply), time.perf_counter() - started)
+                yield sse({"type": "done", "reply": reply})
             except Exception as exc:  # noqa: BLE001 - report failures to the client in-stream
-                log.exception("Agent stream failed")
+                completed = True
+                log.exception("Chat stream failed: session=%s after %.1f s", session_id,
+                              time.perf_counter() - started)
                 yield sse({"type": "error", "message": describe_error(exc)})
             finally:
+                if not completed:
+                    log.warning("Chat stream cancelled (client disconnected): session=%s after %.1f s",
+                                session_id, time.perf_counter() - started)
                 session.close()
 
         return StreamingResponse(
@@ -183,6 +278,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/sessions/{session_id}/messages", dependencies=[Depends(require_api_key)])
     async def get_messages(session_id: str) -> dict[str, Any]:
+        log.info("History request: session=%s", session_id)
         session = open_session(resolve_session_id(session_id))
         try:
             items = await session.get_items()
@@ -202,6 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/sessions/{session_id}", status_code=204, dependencies=[Depends(require_api_key)])
     async def delete_session(session_id: str) -> None:
+        log.info("Delete session request: session=%s", session_id)
         session = open_session(resolve_session_id(session_id))
         try:
             await session.clear_session()
@@ -243,6 +340,7 @@ def main() -> None:
         port=port,
         reload=args.reload,
         app_dir=str(AGENT_DIR),
+        access_log=False,  # the request-logging middleware replaces uvicorn's access log
     )
 
 

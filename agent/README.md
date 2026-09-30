@@ -48,6 +48,8 @@ Real environment variables take precedence over the file.
 | `AGENT_API_KEY` | no | If set, HTTP clients must send `Authorization: Bearer <key>` |
 | `AGENT_CORS_ORIGINS` | no | Browser origins allowed to call the API, i.e. where `ui/` is served. Defaults to `http://localhost:8080,http://127.0.0.1:8080` |
 | `AGENT_SESSIONS_DB` | no | SQLite file for conversation history. Defaults to `agent/sessions.db` |
+| `AGENT_LOG_LEVEL` | no | `INFO` (default) logs every request; `DEBUG` also logs tool arguments |
+| `AGENT_LOG_MESSAGES` | no | `true` (default) includes the first 200 characters of each user message in logs; `false` logs only its length |
 
 ### Choreo authentication
 
@@ -101,6 +103,21 @@ curl -X POST localhost:8000/chat -H 'Content-Type: application/json' \
 ```
 
 Interactive API docs are served at http://localhost:8000/docs.
+
+### Request logs
+
+The server logs every request to stderr. Each line carries a request ID, which you can set by sending an
+`X-Request-ID` header, and which is always returned in the response's `X-Request-ID` header:
+
+```
+2026-09-30 17:16:37,546 INFO  [demo-123] property-finder.server: Request received: POST /chat from 127.0.0.1
+2026-09-30 17:16:37,547 INFO  [demo-123] property-finder.server: Chat request: session=58ec… (new) message="Quote a $450k house in Austin, TX"
+2026-09-30 17:16:38,781 INFO  [demo-123] property-finder.server: Chat completed: session=58ec… tools=['getInsuranceQuoteByDetails'] reply=172 chars in 1.2 s
+2026-09-30 17:16:38,782 INFO  [demo-123] property-finder.server: Response sent: POST /chat -> 200 in 1236 ms
+```
+
+Streaming requests also log each tool call as it happens, and log a warning if the client disconnects
+before the reply finishes.
 
 ## Example prompts
 

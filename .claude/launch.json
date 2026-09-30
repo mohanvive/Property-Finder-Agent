@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "ui/serve.py"
+      ],
+      "port": 8080
+    },
+    {
+      "name": "agent-api",
+      "runtimeExecutable": "agent/.venv/bin/python",
+      "runtimeArgs": [
+        "agent/server.py"
+      ],
+      "port": 8000
+    }
+  ]
+}

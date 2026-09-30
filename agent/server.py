@@ -1,0 +1,250 @@
+"""HTTP API for the PropertyFinder agent.
+
+Endpoints
+  GET    /health                  -> status, model, and connected MCP servers/tools
+  POST   /chat                    -> {"message", "session_id"?} -> {"reply", "session_id"}
+  POST   /chat/stream             -> same body; Server-Sent Events stream (see below)
+  GET    /sessions/{id}/messages  -> conversation history for a session
+  DELETE /sessions/{id}           -> clear a session's history
+
+Stream events (each "data:" line is JSON with a "type" field):
+  session    {"session_id"}               first event, echoes/assigns the session id
+  tool_call  {"name", "arguments"}        the agent invoked an MCP tool
+  tool_done  {"name"}                     the tool returned
+  delta      {"text"}                     a chunk of the reply text
+  done       {"reply"}                    the full final reply
+  error      {"message"}                  the run failed
+
+Run:  python server.py [--config agent/.env] [--host H] [--port P]
+      (host/port come from AGENT_HOST/AGENT_PORT in the config file)
+  or: uvicorn server:create_app --factory --port 8000   (from agent/; config from AGENT_CONFIG or agent/.env)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import secrets
+import sys
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from openai.types.responses import ResponseTextDeltaEvent
+from pydantic import BaseModel, Field
+
+from agents import Agent, Runner, SQLiteSession
+from agents.mcp import MCPServer
+from config import AGENT_DIR, DEFAULT_CONFIG_FILE, ConfigError, Settings, load_settings
+from property_agent import build_agent, configure_openai, connect_servers, describe_error
+
+log = logging.getLogger("property-finder.server")
+
+MAX_TURNS = 15
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+    session_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: str
+
+
+def resolve_session_id(session_id: str | None) -> str:
+    if session_id is None:
+        return uuid.uuid4().hex
+    if not SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="session_id must match [A-Za-z0-9_-]{1,64}")
+    return session_id
+
+
+def sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build the API. Settings default to the file named by AGENT_CONFIG (or agent/.env)."""
+    if settings is None:
+        try:
+            settings = load_settings(os.getenv("AGENT_CONFIG", DEFAULT_CONFIG_FILE))
+        except ConfigError as exc:
+            sys.exit(f"Configuration error: {exc}")
+    cfg = settings
+    agent: Agent | None = None
+    servers: list[MCPServer] = []
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal agent, servers
+        configure_openai(cfg.openai)
+        async with AsyncExitStack() as stack:
+            print("Connecting to MCP servers...")
+            servers = await connect_servers(stack, cfg.mcp_servers)
+            if not servers:
+                raise RuntimeError("No MCP servers available; cannot start.")
+            agent = build_agent(servers, cfg.openai.model)
+            yield
+
+    app = FastAPI(title="PropertyFinder Agent API", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cfg.server.cors_origins,
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    def require_api_key(request: Request) -> None:
+        expected = cfg.server.api_key
+        if not expected:
+            return
+        header = request.headers.get("Authorization", "")
+        token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+        if not secrets.compare_digest(token, expected):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    def open_session(session_id: str) -> SQLiteSession:
+        return SQLiteSession(session_id, db_path=cfg.server.sessions_db)
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        mcp = []
+        for server in servers:
+            tools = await server.list_tools()
+            mcp.append({"name": server.name, "tools": [t.name for t in tools]})
+        return {
+            "status": "ok",
+            "model": cfg.openai.model,
+            "llm_endpoint": cfg.openai.base_url or "https://api.openai.com/v1",
+            "mcp_servers": mcp,
+            "auth_required": bool(cfg.server.api_key),
+        }
+
+    @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
+    async def chat(body: ChatRequest) -> ChatResponse:
+        session_id = resolve_session_id(body.session_id)
+        session = open_session(session_id)
+        try:
+            result = await Runner.run(agent, body.message, session=session, max_turns=MAX_TURNS)
+        except Exception as exc:  # noqa: BLE001 - surface agent failures as HTTP errors
+            log.exception("Agent run failed")
+            raise HTTPException(status_code=502, detail=describe_error(exc)) from exc
+        finally:
+            session.close()
+        return ChatResponse(reply=str(result.final_output), session_id=session_id)
+
+    @app.post("/chat/stream", dependencies=[Depends(require_api_key)])
+    async def chat_stream(body: ChatRequest) -> StreamingResponse:
+        session_id = resolve_session_id(body.session_id)
+
+        async def events() -> AsyncIterator[str]:
+            yield sse({"type": "session", "session_id": session_id})
+            session = open_session(session_id)
+            tool_names: dict[str, str] = {}
+            try:
+                result = Runner.run_streamed(agent, body.message, session=session, max_turns=MAX_TURNS)
+                async for event in result.stream_events():
+                    if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                        yield sse({"type": "delta", "text": event.data.delta})
+                    elif event.type == "run_item_stream_event":
+                        raw = getattr(event.item, "raw_item", None)
+                        if event.name == "tool_called":
+                            name = getattr(raw, "name", None) or "tool"
+                            if call_id := getattr(raw, "call_id", None):
+                                tool_names[call_id] = name
+                            yield sse({"type": "tool_call", "name": name, "arguments": getattr(raw, "arguments", "")})
+                        elif event.name == "tool_output":
+                            call_id = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
+                            yield sse({"type": "tool_done", "name": tool_names.get(call_id, "tool")})
+                yield sse({"type": "done", "reply": str(result.final_output)})
+            except Exception as exc:  # noqa: BLE001 - report failures to the client in-stream
+                log.exception("Agent stream failed")
+                yield sse({"type": "error", "message": describe_error(exc)})
+            finally:
+                session.close()
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/sessions/{session_id}/messages", dependencies=[Depends(require_api_key)])
+    async def get_messages(session_id: str) -> dict[str, Any]:
+        session = open_session(resolve_session_id(session_id))
+        try:
+            items = await session.get_items()
+        finally:
+            session.close()
+        messages = []
+        for item in items:
+            role = item.get("role")
+            if role not in ("user", "assistant"):
+                continue  # skip tool calls/outputs
+            content = item.get("content")
+            if isinstance(content, list):
+                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            if content:
+                messages.append({"role": role, "content": content})
+        return {"session_id": session_id, "messages": messages}
+
+    @app.delete("/sessions/{session_id}", status_code=204, dependencies=[Depends(require_api_key)])
+    async def delete_session(session_id: str) -> None:
+        session = open_session(resolve_session_id(session_id))
+        try:
+            await session.clear_session()
+        finally:
+            session.close()
+
+    return app
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="PropertyFinder HTTP API")
+    parser.add_argument("-c", "--config", default=DEFAULT_CONFIG_FILE, help="Config file to load (default: agent/.env)")
+    parser.add_argument("--host", help="Override AGENT_HOST from the config file")
+    parser.add_argument("--port", type=int, help="Override AGENT_PORT from the config file")
+    parser.add_argument("--reload", action="store_true", help="Auto-reload on code changes (dev)")
+    args = parser.parse_args()
+
+    # Environment variables take precedence over the config file, and reload workers inherit them.
+    os.environ["AGENT_CONFIG"] = str(Path(args.config).resolve())
+    if args.host:
+        os.environ["AGENT_HOST"] = args.host
+    if args.port:
+        os.environ["AGENT_PORT"] = str(args.port)
+    try:
+        settings = load_settings(args.config)
+    except ConfigError as exc:
+        sys.exit(f"Configuration error: {exc}")
+
+    host, port = settings.server.host, settings.server.port
+    shown_host = "localhost" if host in ("127.0.0.1", "0.0.0.0", "::") else host
+    print(f"PropertyFinder agent API: http://{shown_host}:{port}  (set the web UI's AGENT_URL to this)", flush=True)
+    print(f"Allowed web UI origins: {', '.join(settings.server.cors_origins) or '(none)'}", flush=True)
+
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(
+        "server:create_app" if args.reload else create_app(settings),
+        factory=args.reload,
+        host=host,
+        port=port,
+        reload=args.reload,
+        app_dir=str(AGENT_DIR),
+    )
+
+
+if __name__ == "__main__":
+    main()

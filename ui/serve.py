@@ -5,7 +5,7 @@ served to the browser as /config.js, so the static files never need editing.
 
 Settings (environment variables take precedence over ui/.env):
   AGENT_URL        URL of the agent HTTP API     (default: http://localhost:8000)
-  AGENT_API_KEY    API key, if the agent sets AGENT_API_KEY (sent to the browser!)
+  AGENT_API_KEY    sent on every request in the x-api-key header (visible in the browser!)
   UI_HOST          address to listen on          (default: 127.0.0.1)
   UI_PORT          port to listen on             (default: 8080)
 

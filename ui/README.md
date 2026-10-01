@@ -21,7 +21,7 @@ over the file.
 | Setting | Default | Description |
 |---|---|---|
 | `AGENT_URL` | `http://localhost:8000` | Agent HTTP API URL, as the user's browser reaches it |
-| `AGENT_API_KEY` | unset | Only if the agent sets `AGENT_API_KEY`. **This value is sent to the browser.** |
+| `AGENT_API_KEY` | unset | Agent key, sent on every request in the `x-api-key` header (for example, for the API gateway in front of the agent). **This value is visible in the browser.** |
 | `UI_HOST` / `UI_PORT` | `127.0.0.1` / `8080` | Address the UI server listens on |
 
 The agent must allow the UI's address: add `http://UI_HOST:UI_PORT` to `AGENT_CORS_ORIGINS` in
@@ -54,7 +54,7 @@ upload the `ui/` folder.
 ## Overriding the connection in the browser
 
 Click the connection status in the top-right to point the UI at a different agent, or to enter an
-API key. The browser remembers that choice until you click **Use default**, or until the configured
+API key (sent as `x-api-key`). The browser remembers that choice until you click **Use default**, or until the configured
 `AGENT_URL` changes. The configured value then takes over again.
 
 Replies stream through `POST /chat/stream`. The conversation's session ID is kept in the browser, so

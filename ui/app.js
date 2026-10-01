@@ -44,7 +44,7 @@
   const endpoint = (path) => conn.url.replace(/\/+$/, "") + path;
   const headers = () => {
     const h = { "Content-Type": "application/json" };
-    if (conn.apiKey) h.Authorization = `Bearer ${conn.apiKey}`;
+    if (conn.apiKey) h["x-api-key"] = conn.apiKey;
     return h;
   };
 

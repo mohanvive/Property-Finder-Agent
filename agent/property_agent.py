@@ -60,6 +60,7 @@ def describe_error(exc: BaseException) -> str:
 
 def configure_openai(cfg: OpenAIConfig) -> None:
     """Point the Agents SDK at the configured OpenAI (or OpenAI-compatible) endpoint."""
+    print(f"LLM endpoint: {cfg.base_url} (model: {cfg.model}, API: {cfg.api_mode})", flush=True)
     set_default_openai_client(AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url))
     set_default_openai_api(cfg.api_mode)
     # Traces are uploaded to OpenAI, which fails for other endpoints unless tracing is off.

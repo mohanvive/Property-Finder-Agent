@@ -234,7 +234,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "status": "ok",
             "model": cfg.openai.model,
-            "llm_endpoint": cfg.openai.base_url or "https://api.openai.com/v1",
+            "llm_endpoint": cfg.openai.base_url,
             "mcp_servers": mcp,
         }
 

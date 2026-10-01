@@ -50,8 +50,7 @@ async def main() -> None:
             print(await ask(agent, " ".join(args.question), session))
             return
 
-        endpoint = settings.openai.base_url or "api.openai.com"
-        print(f"\nPropertyFinder ready (model: {settings.openai.model} @ {endpoint}). Type 'exit' to quit.\n")
+        print(f"\nPropertyFinder ready (model: {settings.openai.model} @ {settings.openai.base_url}). Type 'exit' to quit.\n")
         while True:
             try:
                 question = (await asyncio.to_thread(input, "You: ")).strip()

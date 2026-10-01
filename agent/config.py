@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 AGENT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_FILE = str(AGENT_DIR / ".env")
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 class ConfigError(Exception):
@@ -24,7 +25,7 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class OpenAIConfig:
     api_key: str
-    base_url: str | None  # None -> the OpenAI default (https://api.openai.com/v1)
+    base_url: str  # OpenAI or OpenAI-compatible API URL (OPENAI_BASE_URL)
     model: str
     api_mode: str  # "responses" or "chat_completions"
     disable_tracing: bool
@@ -76,6 +77,13 @@ def _flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def _url(name: str, default: str) -> str:
+    value = (os.getenv(name, "").strip() or default).rstrip("/")
+    if not value.startswith(("http://", "https://")):
+        raise ConfigError(f"{name} must be an http(s) URL, got: {value!r}")
+    return value
+
+
 def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
     """Load settings from ``config_file`` (if present) and the process environment.
 
@@ -103,7 +111,7 @@ def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
     return Settings(
         openai=OpenAIConfig(
             api_key=_require("OPENAI_API_KEY"),
-            base_url=_optional("OPENAI_BASE_URL"),
+            base_url=_url("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
             model=os.getenv("OPENAI_MODEL", "").strip() or "gpt-5-mini",
             api_mode=api_mode,
             disable_tracing=_flag("OPENAI_AGENTS_DISABLE_TRACING"),

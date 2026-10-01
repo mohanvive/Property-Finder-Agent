@@ -38,6 +38,7 @@ Real environment variables take precedence over the file.
 | Setting | Required | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | yes | API key for the LLM endpoint |
+| `OPENAI_API_KEY_HEADER` | no | Header that carries `OPENAI_API_KEY`, sent as `<header>: <key>`. Defaults to `API-Key`. Set to `Authorization` for the standard OpenAI `Authorization: Bearer <key>` |
 | `OPENAI_BASE_URL` | no | OpenAI-compatible endpoint. Defaults to `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | no | Model name. Defaults to `gpt-5-mini` |
 | `OPENAI_API_MODE` | no | `responses` (default), or `chat_completions` for endpoints without the Responses API |

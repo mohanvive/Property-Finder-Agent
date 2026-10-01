@@ -11,9 +11,11 @@ Front ends: cli.py (terminal chat) and server.py (HTTP API).
 from __future__ import annotations
 
 import sys
+
+import httpx
 from contextlib import AsyncExitStack
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from agents import (
     Agent,
@@ -58,10 +60,32 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+async def _drop_authorization_header(request: httpx.Request) -> None:
+    request.headers.pop("Authorization", None)
+
+
+def build_openai_client(cfg: OpenAIConfig) -> AsyncOpenAI:
+    """Create the OpenAI client, sending the API key in the configured header.
+
+    With OPENAI_API_KEY_HEADER=Authorization this is the standard client ("Authorization: Bearer <key>").
+    Otherwise the key goes in that header (e.g. "API-Key: <key>") and no Authorization header is sent.
+    The SDK always adds "Authorization: Bearer <api_key>" itself, so it's removed just before sending.
+    """
+    if cfg.api_key_header.lower() == "authorization":
+        return AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+    return AsyncOpenAI(
+        api_key=cfg.api_key,
+        base_url=cfg.base_url,
+        default_headers={cfg.api_key_header: cfg.api_key},
+        http_client=DefaultAsyncHttpxClient(event_hooks={"request": [_drop_authorization_header]}),
+    )
+
+
 def configure_openai(cfg: OpenAIConfig) -> None:
     """Point the Agents SDK at the configured OpenAI (or OpenAI-compatible) endpoint."""
-    print(f"LLM endpoint: {cfg.base_url} (model: {cfg.model}, API: {cfg.api_mode})", flush=True)
-    set_default_openai_client(AsyncOpenAI(api_key=cfg.api_key, base_url=cfg.base_url))
+    print(f"LLM endpoint: {cfg.base_url} (model: {cfg.model}, API: {cfg.api_mode}, "
+          f"key header: {cfg.api_key_header})", flush=True)
+    set_default_openai_client(build_openai_client(cfg))
     set_default_openai_api(cfg.api_mode)
     # Traces are uploaded to OpenAI, which fails for other endpoints unless tracing is off.
     if cfg.disable_tracing:

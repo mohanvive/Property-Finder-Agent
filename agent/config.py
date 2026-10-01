@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 AGENT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_FILE = str(AGENT_DIR / ".env")
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_API_KEY_HEADER = "API-Key"
 
 
 class ConfigError(Exception):
@@ -26,6 +27,7 @@ class ConfigError(Exception):
 class OpenAIConfig:
     api_key: str
     base_url: str  # OpenAI or OpenAI-compatible API URL (OPENAI_BASE_URL)
+    api_key_header: str  # header carrying api_key; "Authorization" means the standard "Bearer <key>"
     model: str
     api_mode: str  # "responses" or "chat_completions"
     disable_tracing: bool
@@ -112,6 +114,7 @@ def load_settings(config_file: str | Path = DEFAULT_CONFIG_FILE) -> Settings:
         openai=OpenAIConfig(
             api_key=_require("OPENAI_API_KEY"),
             base_url=_url("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
+            api_key_header=os.getenv("OPENAI_API_KEY_HEADER", "").strip() or DEFAULT_OPENAI_API_KEY_HEADER,
             model=os.getenv("OPENAI_MODEL", "").strip() or "gpt-5-mini",
             api_mode=api_mode,
             disable_tracing=_flag("OPENAI_AGENTS_DISABLE_TRACING"),

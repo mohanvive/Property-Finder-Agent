@@ -64,7 +64,19 @@ subscribe it to the API, and generate keys. Then set one of these:
 The `INSURANCE_QUOTER_` prefix works the same way. Use the `CHOREO_` prefix to share credentials across
 both servers.
 
-If a server can't be reached, the agent skips it with a warning and runs with the tools it has.
+### MCP connections
+
+The Choreo MCP servers sometimes reject or drop a session (`Invalid session ID`, `Session terminated`).
+To stay reliable, the agent:
+
+- opens fresh MCP connections for each chat request instead of holding long-lived sessions, which
+  break as soon as the server drops them;
+- retries each connection up to 3 times, logging `connection attempt N/3 failed` warnings;
+- keeps working if a server is still unreachable after retrying, and tells the model so it can say
+  that, for example, insurance quotes are temporarily unavailable. `/health` then reports
+  `"status": "degraded"` and which server is down.
+
+This adds about a second per request for connection setup.
 
 ## Command line
 
@@ -85,7 +97,7 @@ python server.py --reload                # auto-reload during development
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Status, model, LLM endpoint, and connected MCP servers/tools |
+| `GET` | `/health` | `ok` or `degraded`, model, LLM endpoint, and each MCP server's last connection status and tools |
 | `POST` | `/chat` | `{"message", "session_id"?}` → `{"reply", "session_id"}` |
 | `POST` | `/chat/stream` | Same body; Server-Sent Events: `session`, `tool_call`, `tool_done`, `delta`, `done`, `error` |
 | `GET` | `/sessions/{id}/messages` | Conversation history |

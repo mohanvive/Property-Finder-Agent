@@ -1,7 +1,7 @@
 """HTTP API for the PropertyFinder agent.
 
 Endpoints
-  GET    /health                  -> status, model, and connected MCP servers/tools
+  GET    /health                  -> status ("ok"/"degraded"), model, MCP server status/tools
   POST   /chat                    -> {"message", "session_id"?} -> {"reply", "session_id"}
   POST   /chat/stream             -> same body; Server-Sent Events stream (see below)
   GET    /sessions/{id}/messages  -> conversation history for a session
@@ -34,7 +34,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,16 +46,23 @@ from openai.types.responses import ResponseTextDeltaEvent
 from pydantic import BaseModel, Field
 
 from agents import Agent, Runner, RunResult, SQLiteSession
-from agents.items import ToolCallItem
-from agents.mcp import MCPServer
+from agents.items import ToolCallItem, ToolCallOutputItem
 from config import AGENT_DIR, DEFAULT_CONFIG_FILE, ConfigError, Settings, load_settings
-from property_agent import build_agent, configure_openai, connect_servers, describe_error
+from property_agent import (
+    MCPConnections,
+    build_agent,
+    configure_openai,
+    describe_error,
+    open_mcp_servers,
+    print_connection_report,
+)
 
 log = logging.getLogger("property-finder.server")
 
 MAX_TURNS = 15
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MESSAGE_PREVIEW_CHARS = 200
+TOOL_ERROR_PREFIX = "An error occurred while running the tool"  # Agents SDK's tool-failure output
 
 # Request ID of the request being handled, attached to every log line it produces.
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
@@ -142,6 +149,14 @@ def tool_calls_in(result: RunResult) -> list[str]:
     ]
 
 
+def failed_tool_outputs(result: RunResult) -> list[str]:
+    return [
+        str(item.output)[:300]
+        for item in result.new_items
+        if isinstance(item, ToolCallOutputItem) and str(item.output).startswith(TOOL_ERROR_PREFIX)
+    ]
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     session_id: str | None = None
@@ -174,20 +189,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings
     setup_logging(cfg.server.log_level)
     sessions_db = resolve_sessions_db(cfg.server.sessions_db)
-    agent: Agent | None = None
-    servers: list[MCPServer] = []
+    # Latest known state of each MCP server, refreshed on every request (reported by /health).
+    mcp_status: dict[str, dict[str, Any]] = {}
+
+    def record_status(connections: MCPConnections) -> None:
+        checked_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        for name, tools in connections.tools.items():
+            mcp_status[name] = {"name": name, "connected": True, "tools": tools, "checked_at": checked_at}
+        for name, error in connections.unavailable.items():
+            previous = mcp_status.get(name, {})
+            mcp_status[name] = {"name": name, "connected": False, "tools": previous.get("tools", []),
+                                "error": error, "checked_at": checked_at}
+
+    @asynccontextmanager
+    async def agent_for_request() -> AsyncIterator[Agent]:
+        """Open fresh MCP connections for one request and build the agent on them."""
+        async with open_mcp_servers(cfg.mcp_servers) as connections:
+            record_status(connections)
+            if connections.unavailable:
+                log.warning("Running without unavailable MCP servers: %s", ", ".join(connections.unavailable))
+            yield build_agent(connections, cfg.openai.model)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        nonlocal agent, servers
         configure_openai(cfg.openai)
-        async with AsyncExitStack() as stack:
-            print("Connecting to MCP servers...")
-            servers = await connect_servers(stack, cfg.mcp_servers)
-            if not servers:
-                raise RuntimeError("No MCP servers available; cannot start.")
-            agent = build_agent(servers, cfg.openai.model)
-            yield
+        # Startup check only: report reachability. Each request opens its own MCP connections.
+        print("Checking MCP servers...", flush=True)
+        async with open_mcp_servers(cfg.mcp_servers) as connections:
+            record_status(connections)
+            print_connection_report(connections, cfg.mcp_servers)
+        yield
 
     app = FastAPI(title="PropertyFinder Agent API", version="1.0.0", lifespan=lifespan)
     app.add_middleware(
@@ -227,15 +258,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        mcp = []
-        for server in servers:
-            tools = await server.list_tools()
-            mcp.append({"name": server.name, "tools": [t.name for t in tools]})
+        servers = [mcp_status.get(c.name, {"name": c.name, "connected": False, "tools": []})
+                   for c in cfg.mcp_servers]
         return {
-            "status": "ok",
+            "status": "ok" if all(s["connected"] for s in servers) else "degraded",
             "model": cfg.openai.model,
             "llm_endpoint": cfg.openai.base_url,
-            "mcp_servers": mcp,
+            "mcp_servers": servers,
         }
 
     @app.post("/chat", response_model=ChatResponse)
@@ -246,12 +275,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         started = time.perf_counter()
         session = open_session(session_id)
         try:
-            result = await Runner.run(agent, body.message, session=session, max_turns=MAX_TURNS)
+            async with agent_for_request() as agent:
+                result = await Runner.run(agent, body.message, session=session, max_turns=MAX_TURNS)
         except Exception as exc:  # noqa: BLE001 - surface agent failures as HTTP errors
             log.exception("Chat failed: session=%s after %.1f s", session_id, time.perf_counter() - started)
             raise HTTPException(status_code=502, detail=describe_error(exc)) from exc
         finally:
             session.close()
+        for failure in failed_tool_outputs(result):
+            log.warning("Tool failed: session=%s: %s", session_id, failure)
         reply = str(result.final_output)
         log.info("Chat completed: session=%s tools=%s reply=%d chars in %.1f s", session_id,
                  tool_calls_in(result) or "none", len(reply), time.perf_counter() - started)
@@ -273,27 +305,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tool_names: dict[str, str] = {}
             completed = False
             try:
-                result = Runner.run_streamed(agent, body.message, session=session, max_turns=MAX_TURNS)
-                async for event in result.stream_events():
-                    if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
-                        yield sse({"type": "delta", "text": event.data.delta})
-                    elif event.type == "run_item_stream_event":
-                        raw = getattr(event.item, "raw_item", None)
-                        if event.name == "tool_called":
-                            name = getattr(raw, "name", None) or "tool"
-                            if call_id := getattr(raw, "call_id", None):
-                                tool_names[call_id] = name
-                            log.info("Tool call: session=%s tool=%s", session_id, name)
-                            log.debug("Tool arguments: %s", getattr(raw, "arguments", ""))
-                            yield sse({"type": "tool_call", "name": name, "arguments": getattr(raw, "arguments", "")})
-                        elif event.name == "tool_output":
-                            call_id = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
-                            yield sse({"type": "tool_done", "name": tool_names.get(call_id, "tool")})
-                reply = str(result.final_output)
-                completed = True
-                log.info("Chat stream completed: session=%s tools=%s reply=%d chars in %.1f s", session_id,
-                         list(tool_names.values()) or "none", len(reply), time.perf_counter() - started)
-                yield sse({"type": "done", "reply": reply})
+                async with agent_for_request() as agent:
+                    result = Runner.run_streamed(agent, body.message, session=session, max_turns=MAX_TURNS)
+                    async for event in result.stream_events():
+                        if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                            yield sse({"type": "delta", "text": event.data.delta})
+                        elif event.type == "run_item_stream_event":
+                            raw = getattr(event.item, "raw_item", None)
+                            if event.name == "tool_called":
+                                name = getattr(raw, "name", None) or "tool"
+                                if call_id := getattr(raw, "call_id", None):
+                                    tool_names[call_id] = name
+                                log.info("Tool call: session=%s tool=%s", session_id, name)
+                                log.debug("Tool arguments: %s", getattr(raw, "arguments", ""))
+                                yield sse({"type": "tool_call", "name": name, "arguments": getattr(raw, "arguments", "")})
+                            elif event.name == "tool_output":
+                                call_id = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
+                                name = tool_names.get(call_id, "tool")
+                                output = str(getattr(event.item, "output", ""))
+                                if output.startswith(TOOL_ERROR_PREFIX):
+                                    log.warning("Tool failed: session=%s tool=%s: %s", session_id, name, output[:300])
+                                yield sse({"type": "tool_done", "name": name})
+                    reply = str(result.final_output)
+                    completed = True
+                    log.info("Chat stream completed: session=%s tools=%s reply=%d chars in %.1f s", session_id,
+                             list(tool_names.values()) or "none", len(reply), time.perf_counter() - started)
+                    yield sse({"type": "done", "reply": reply})
             except Exception as exc:  # noqa: BLE001 - report failures to the client in-stream
                 completed = True
                 log.exception("Chat stream failed: session=%s after %.1f s", session_id,

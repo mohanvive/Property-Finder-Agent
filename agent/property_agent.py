@@ -10,10 +10,14 @@ Front ends: cli.py (terminal chat) and server.py (HTTP API).
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import sys
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass, field
 
 import httpx
-from contextlib import AsyncExitStack
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
@@ -27,6 +31,15 @@ from agents.mcp import MCPServer, MCPServerStreamableHttp
 from auth import build_auth
 from config import MCPServerConfig, OpenAIConfig
 
+log = logging.getLogger("property-finder.mcp")
+
+# The Choreo MCP servers sometimes reject a session right after creating it ("Invalid session ID",
+# "Session terminated"), e.g. when a request lands on a replica that didn't create the session.
+# Each connection is therefore retried, and sessions are opened per request instead of being kept
+# open for the life of the process (a long-lived session breaks as soon as the server drops it).
+MCP_CONNECT_ATTEMPTS = 3
+MCP_RETRY_BACKOFF_SECONDS = 0.5
+
 INSTRUCTIONS = """\
 You are PropertyFinder, a helpful real-estate assistant for US properties.
 
@@ -39,9 +52,19 @@ You can:
 Guidelines:
 - Always use the tools for property listings and premium figures; never invent
   listings, prices, or quotes.
-- When a property came from a search result and has an ID, prefer
-  getInsuranceQuoteByPropertyId. Use getInsuranceQuoteByDetails for properties
-  not in the database or hypothetical scenarios.
+- Whenever the user asks about insurance, premiums, coverage, risk, or the cost of
+  insuring a property, call the insurance-quoter tools. Never estimate premiums
+  yourself or reuse figures from memory.
+- For properties from a search result (they have a property ID), call
+  getInsuranceQuoteByPropertyId for each property the user asks about. Use
+  getInsuranceQuoteByDetails for properties not in the database or hypothetical
+  scenarios, getInsuranceAddOns for optional coverage, and compareInsuranceByState
+  to compare locations.
+- If the user asks for properties and insurance together, search first, then quote
+  each property found (up to 5), and present listing and premium side by side.
+- After listing properties without quotes, offer to get insurance quotes for them.
+- If an insurance tool call fails, retry it once; if it still fails, tell the user
+  the quote couldn't be retrieved right now. Never make up a quote.
 - Insurance categories are RESIDENTIAL_RENTAL, RESIDENTIAL_SALE, or BUSINESS, and
   states are 2-letter abbreviations (e.g. CA, TX).
 - If key details are missing (location, budget, property type), make a
@@ -106,34 +129,96 @@ def make_server(cfg: MCPServerConfig) -> MCPServerStreamableHttp:
     )
 
 
-async def connect_servers(stack: AsyncExitStack, configs: list[MCPServerConfig]) -> list[MCPServer]:
-    """Connect to each MCP server, skipping (with a warning) any that fail."""
-    connected: list[MCPServer] = []
-    for cfg in configs:
+async def _cleanup_quietly(server: MCPServer) -> None:
+    try:
+        await server.cleanup()
+    except Exception as exc:  # noqa: BLE001 - a failed close must not break the request
+        log.debug("Ignoring error closing MCP server %s: %s", server.name, describe_error(exc))
+
+
+async def connect_with_retry(cfg: MCPServerConfig) -> tuple[MCPServerStreamableHttp, list[str]]:
+    """Connect to one MCP server and list its tools, retrying rejected sessions."""
+    last_error: Exception | None = None
+    for attempt in range(1, MCP_CONNECT_ATTEMPTS + 1):
         server = make_server(cfg)
-        prefix = cfg.env_prefix
         try:
-            await stack.enter_async_context(server)
+            await server.connect()
             tools = await server.list_tools()
-            print(f"  ✓ {server.name}: {', '.join(t.name for t in tools)}")
-            connected.append(server)
-        except Exception as exc:  # noqa: BLE001 - report and keep going with the other server
-            reason = describe_error(exc)
-            print(f"  ✗ {server.name}: could not connect to {cfg.url} ({reason})", file=sys.stderr)
-            headers, auth = build_auth(prefix)
-            if auth is None and "Authorization" not in headers:
-                print(
-                    f"    No credentials configured. The endpoint may require a Choreo token: set "
-                    f"{prefix}_CLIENT_ID/{prefix}_CLIENT_SECRET or {prefix}_ACCESS_TOKEN in the config file.",
-                    file=sys.stderr,
-                )
-    return connected
+            if attempt > 1:
+                log.info("Connected to MCP server %s on attempt %d", cfg.name, attempt)
+            return server, [t.name for t in tools]
+        except Exception as exc:  # noqa: BLE001 - retried below, then reported to the caller
+            last_error = exc
+            await _cleanup_quietly(server)
+            log.warning("MCP server %s: connection attempt %d/%d failed (%s)",
+                        cfg.name, attempt, MCP_CONNECT_ATTEMPTS, describe_error(exc))
+            if attempt < MCP_CONNECT_ATTEMPTS:
+                await asyncio.sleep(MCP_RETRY_BACKOFF_SECONDS * attempt)
+    assert last_error is not None
+    raise last_error
 
 
-def build_agent(servers: list[MCPServer], model: str) -> Agent:
+@dataclass
+class MCPConnections:
+    servers: list[MCPServer] = field(default_factory=list)
+    tools: dict[str, list[str]] = field(default_factory=dict)  # server name -> tool names
+    unavailable: dict[str, str] = field(default_factory=dict)  # server name -> error
+
+
+@asynccontextmanager
+async def open_mcp_servers(configs: list[MCPServerConfig]) -> AsyncIterator[MCPConnections]:
+    """Connect to every MCP server (with retries) for the duration of one request.
+
+    Servers that still fail are listed in ``unavailable`` instead of aborting, so the agent can
+    work with the rest and tell the user what's missing. Connections are opened and closed in
+    the same task, as the MCP client requires.
+    """
+    connections = MCPConnections()
+    async with AsyncExitStack() as stack:
+        for cfg in configs:
+            try:
+                server, tools = await connect_with_retry(cfg)
+            except Exception as exc:  # noqa: BLE001 - recorded and reported, not fatal
+                connections.unavailable[cfg.name] = describe_error(exc)
+                log.error("MCP server %s unavailable after %d attempts: %s",
+                          cfg.name, MCP_CONNECT_ATTEMPTS, connections.unavailable[cfg.name])
+                continue
+            stack.push_async_callback(_cleanup_quietly, server)
+            connections.servers.append(server)
+            connections.tools[cfg.name] = tools
+        yield connections
+
+
+def print_connection_report(connections: MCPConnections, configs: list[MCPServerConfig]) -> None:
+    """Print a startup summary of which MCP servers are reachable."""
+    for cfg in configs:
+        if cfg.name in connections.tools:
+            print(f"  ✓ {cfg.name}: {', '.join(connections.tools[cfg.name])}", flush=True)
+            continue
+        print(f"  ✗ {cfg.name}: could not connect to {cfg.url} ({connections.unavailable.get(cfg.name)})",
+              file=sys.stderr, flush=True)
+        headers, auth = build_auth(cfg.env_prefix)
+        if auth is None and "Authorization" not in headers:
+            prefix = cfg.env_prefix
+            print(
+                f"    No credentials configured. The endpoint may require a Choreo token: set "
+                f"{prefix}_CLIENT_ID/{prefix}_CLIENT_SECRET or {prefix}_ACCESS_TOKEN in the config file.",
+                file=sys.stderr, flush=True,
+            )
+
+
+def build_agent(connections: MCPConnections, model: str) -> Agent:
+    instructions = INSTRUCTIONS
+    if connections.unavailable:
+        names = ", ".join(sorted(connections.unavailable))
+        instructions += (
+            f"\nService status: the {names} service is temporarily unavailable, so its tools are "
+            "missing. If the user needs it (e.g. insurance quotes), say it can't be reached right "
+            "now and suggest trying again shortly. Do not guess its results.\n"
+        )
     return Agent(
         name="PropertyFinder",
-        instructions=INSTRUCTIONS,
+        instructions=instructions,
         model=model,
-        mcp_servers=servers,
+        mcp_servers=connections.servers,
     )
